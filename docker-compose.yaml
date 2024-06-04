@@ -1,0 +1,162 @@
+version: "3.8"
+
+networks:
+  netflix:
+    name: netflix
+
+services:
+  cassandra:
+    image: cassandra:5.0
+    container_name: cassandra
+    hostname: cassandra
+    ports:
+      - "9042:9042"
+    networks:
+      - netflix
+    environment:
+      - CASSANDRA_SEEDS=cassandra
+      - CASSANDRA_CLUSTER_NAME=NetflixCluster
+      - CASSANDRA_DC=DC1
+      - CASSANDRA_RACK=RACK1
+      - CASSANDRA_ENDPOINT_SNITCH=GossipingPropertyFileSnitch
+      - CASSANDRA_NUM_TOKENS=128
+    deploy:
+      resources:
+        limits:
+          cpus: '0.20'
+          memory: 4G
+  
+  # Minio (Iceberg Storage)
+  minio:
+    image: quay.io/minio/minio:RELEASE.2024-05-10T01-41-38Z
+    container_name: minio
+    command: ["server", "/data", "--console-address", ":9001"]
+    environment:
+      - MINIO_ROOT_USER=admin
+      - MINIO_ROOT_PASSWORD=password
+      - MINIO_DOMAIN=minio
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    networks:
+      - netflix
+    ports:
+      - 9001:9001
+      - 9000:9000
+    deploy:
+      resources:
+        limits:
+          cpus: '0.10'
+          memory: 512M
+    
+  # MageAI for Orchestration
+  mageai:
+    image: mageai/mageai:0.9.71
+    container_name: mageai
+    command: mage start ${PROJECT_NAME}
+    env_file:
+      - .env
+    environment:
+      USER_CODE_PATH: /home/src/${PROJECT_NAME}
+      #ENV: ${ENV}
+    ports:
+      - 6789:6789
+    volumes:
+      - ./mageai:/home/src/
+    restart: on-failure:5
+    networks:
+      - netflix
+    deploy:
+      resources:
+        limits:
+          cpus: '0.20'
+          memory: 1G
+
+  # Elasticsearch
+  elastic:
+    image: docker.elastic.co/elasticsearch/elasticsearch:7.17.2
+    container_name: elastic
+    environment:
+      - discovery.type=single-node
+      - xpack.security.enabled=false
+      #- ES_JAVA_OPTS="-Xms1g -Xmx1g"
+    ports:
+      - 9200:9200
+      - 9300:9300
+    deploy:
+      resources:
+        limits:
+          cpus: '0.50'
+          memory: 1G
+
+  # Redpanda
+  redpanda:
+    command:
+      - redpanda
+      - start
+      - --kafka-addr internal://0.0.0.0:9092,external://0.0.0.0:19092
+      # Address the broker advertises to clients that connect to the Kafka API.
+      # Use the internal addresses to connect to the Redpanda brokers'
+      # from inside the same Docker network.
+      # Use the external addresses to connect to the Redpanda brokers'
+      # from outside the Docker network.
+      - --advertise-kafka-addr internal://redpanda:9092,external://localhost:19092
+      - --pandaproxy-addr internal://0.0.0.0:8082,external://0.0.0.0:18082
+      # Address the broker advertises to clients that connect to the HTTP Proxy.
+      - --advertise-pandaproxy-addr internal://redpanda:8082,external://localhost:18082
+      - --schema-registry-addr internal://0.0.0.0:8081,external://0.0.0.0:18081
+      # Redpanda brokers use the RPC API to communicate with each other internally.
+      - --rpc-addr redpanda:33145
+      - --advertise-rpc-addr redpanda:33145
+      # Mode dev-container uses well-known configuration properties for development in containers.
+      - --mode dev-container
+      # Tells Seastar (the framework Redpanda uses under the hood) to use 1 core on the system.
+      - --smp 1
+      - --default-log-level=info
+    image: docker.redpanda.com/redpandadata/redpanda:v24.1.6
+    container_name: redpanda
+    ports:
+      - 18081:18081
+      - 18082:18082
+      - 19092:19092
+      - 19644:9644
+      - 9092:9092
+    networks:
+      - netflix
+    deploy:
+      resources:
+        limits:
+          cpus: '0.20'
+          memory: 1G
+
+
+  redpanda-console:
+    container_name: redpanda-console
+    image: docker.redpanda.com/redpandadata/console:v2.6.0
+    entrypoint: /bin/sh
+    command: -c 'echo "$$CONSOLE_CONFIG_FILE" > /tmp/config.yml; /app/console'
+    environment:
+      CONFIG_FILEPATH: /tmp/config.yml
+      CONSOLE_CONFIG_FILE: |
+        kafka:
+          brokers: ["redpanda:9092"]
+          schemaRegistry:
+            enabled: true
+            urls: ["http://redpanda:18081"]
+        redpanda:
+          adminApi:
+            enabled: true
+            urls: ["http://redpanda:19644"]
+    ports:
+      - 8080:8080
+    depends_on:
+      - redpanda
+    networks:
+      - netflix
+    deploy:
+      resources:
+        limits:
+          cpus: '0.10'
+          memory: 300M
